@@ -10,7 +10,9 @@ use alloy_eips::eip7685::Requests;
 use alloy_primitives::{Address, BlockNumber, Bloom, Bytes, B256, B64, U256};
 use reth_codecs::Compact;
 
-use crate::{BlockBody, BlockHeader, Body, FullBlockBody, FullBlockHeader, Header, InMemorySize};
+use crate::{
+    BlockBody, BlockHeader, Body, FullBlockBody, FullBlockHeader, Header, InMemorySize, MaybeSerde,
+};
 
 /// Helper trait that unifies all behaviour required by block to support full node operations.
 pub trait FullBlock: Block<Header: FullBlockHeader, Body: FullBlockBody> + Compact {}
@@ -21,6 +23,7 @@ impl<T> FullBlock for T where T: Block<Header: FullBlockHeader, Body: FullBlockB
 // todo: make sealable super-trait, depends on <https://github.com/paradigmxyz/reth/issues/11449>
 // todo: make with senders extension trait, so block can be impl by block type already containing
 // senders
+#[auto_impl::auto_impl(&, Arc)]
 pub trait Block:
     Send
     + Sync
@@ -30,17 +33,16 @@ pub trait Block:
     + fmt::Debug
     + PartialEq
     + Eq
-    + serde::Serialize
-    + for<'a> serde::Deserialize<'a>
     + Header
     + Body<
         Self::Header,
         <Self::Body as BlockBody>::Transaction,
         <Self::Body as BlockBody>::Withdrawals,
     > + InMemorySize
+    + MaybeSerde
 {
     /// Header part of the block.
-    type Header: BlockHeader;
+    type Header: BlockHeader + 'static;
 
     /// The block's body contains the transactions in the block.
     type Body: BlockBody<Header = Self::Header>;

@@ -7,8 +7,8 @@ use alloy_primitives::{Address, B256};
 use reth_codecs::Compact;
 
 use crate::{
-    BlockHeader, FullBlockHeader, FullSignedTx, InMemorySize, SignedTransaction, TransactionExt,
-    TxType,
+    BlockHeader, FullBlockHeader, FullSignedTx, InMemorySize, MaybeSerde, SignedTransaction,
+    TransactionExt, TxType,
 };
 
 /// Helper trait that unifies all behaviour required by block to support full node operations.
@@ -23,6 +23,9 @@ impl<T> FullBlockBody for T where
 }
 
 /// Abstraction of block's body.
+
+/// Abstraction for block's body.
+#[auto_impl::auto_impl(&, Arc)]
 pub trait BlockBody:
     Send
     + Sync
@@ -32,12 +35,10 @@ pub trait BlockBody:
     + fmt::Debug
     + PartialEq
     + Eq
-    + serde::Serialize
-    + for<'de> serde::Deserialize<'de>
     + alloy_rlp::Encodable
     + alloy_rlp::Decodable
     + InMemorySize
-    + 'static
+    + MaybeSerde
 {
     /// Signed transaction.
     type Transaction: SignedTransaction;
@@ -81,17 +82,17 @@ pub trait BlockBody:
 
     /// Returns whether or not the block body contains any blob transactions.
     fn has_blob_transactions(&self) -> bool {
-        self.transactions().iter().any(|tx| tx.tx_type().is_eip4844())
+        self.transactions().iter().any(|tx| tx.transaction().tx_type().is_eip4844())
     }
 
     /// Returns whether or not the block body contains any EIP-7702 transactions.
     fn has_eip7702_transactions(&self) -> bool {
-        self.transactions().iter().any(|tx| tx.tx_type().is_eip7702())
+        self.transactions().iter().any(|tx| tx.transaction().tx_type().is_eip7702())
     }
 
     /// Returns an iterator over all blob transactions of the block
     fn blob_transactions_iter(&self) -> impl Iterator<Item = &Self::Transaction> {
-        self.transactions().iter().filter(|tx| tx.tx_type().is_eip4844())
+        self.transactions().iter().filter(|tx| tx.transaction().tx_type().is_eip4844())
     }
 
     /// Returns only the blob transactions, if any, from the block body.
