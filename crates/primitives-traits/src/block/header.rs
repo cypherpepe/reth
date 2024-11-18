@@ -23,8 +23,6 @@ pub trait BlockHeader:
     + fmt::Debug
     + PartialEq
     + Eq
-    + serde::Serialize
-    + for<'de> serde::Deserialize<'de>
     + alloy_rlp::Encodable
     + alloy_rlp::Decodable
     + alloy_consensus::BlockHeader
