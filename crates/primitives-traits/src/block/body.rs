@@ -1,15 +1,30 @@
 //! Block body abstraction.
 
 use alloc::{fmt, vec::Vec};
+#[cfg(feature = "std")]
+use std::sync::LazyLock;
 
 use alloy_eips::{eip4895::Withdrawal, eip7685::Requests};
 use alloy_primitives::{Address, B256};
+use once_cell as _;
+#[cfg(not(feature = "std"))]
+use once_cell::sync::Lazy as LazyLock;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reth_codecs::Compact;
 
 use crate::{
     BlockHeader, FullBlockHeader, FullSignedTx, InMemorySize, MaybeSerde, SignedTransaction,
     TransactionExt, TxType,
 };
+
+/// Expected number of transactions where we can expect a speed-up by recovering the senders in
+/// parallel.
+pub static PARALLEL_SENDER_RECOVERY_THRESHOLD: LazyLock<usize> =
+    LazyLock::new(|| match rayon::current_num_threads() {
+        0..=1 => usize::MAX,
+        2..=8 => 10,
+        _ => 5,
+    });
 
 /// Helper trait that unifies all behaviour required by block to support full node operations.
 pub trait FullBlockBody:
@@ -23,8 +38,6 @@ impl<T> FullBlockBody for T where
 }
 
 /// Abstraction of block's body.
-
-/// Abstraction for block's body.
 #[auto_impl::auto_impl(&, Arc)]
 pub trait BlockBody:
     Send
@@ -41,13 +54,13 @@ pub trait BlockBody:
     + MaybeSerde
 {
     /// Signed transaction.
-    type Transaction: SignedTransaction;
+    type Transaction: SignedTransaction + 'static;
 
     /// Header type (uncle blocks).
-    type Header: BlockHeader;
+    type Header: BlockHeader + 'static;
 
     /// Withdrawals in block.
-    type Withdrawals: IntoIterator<Item = Withdrawal>;
+    type Withdrawals: IntoIterator<Item = Withdrawal> + 'static;
 
     /// Returns reference to transactions in block.
     fn transactions(&self) -> &[Self::Transaction];
@@ -76,8 +89,11 @@ pub trait BlockBody:
 
     /// Recover signer addresses for all transactions in the block body.
     fn recover_signers(&self) -> Option<Vec<Address>> {
-        let num_txns = self.transactions().len();
-        Self::Transaction::recover_signers(self.transactions(), num_txns)
+        if self.transactions().len() < *PARALLEL_SENDER_RECOVERY_THRESHOLD {
+            self.transactions().iter().map(|tx| tx.recover_signer()).collect()
+        } else {
+            self.transactions().par_iter().map(|tx| tx.recover_signer()).collect()
+        }
     }
 
     /// Returns whether or not the block body contains any blob transactions.
@@ -108,7 +124,7 @@ pub trait BlockBody:
 }
 
 /// Helper trait to implement [`BlockBody`] functionality for [`Block`](crate::Block) types.
-pub trait Body<Header, SignedTx: SignedTransaction, Withdrawals> {
+pub trait Body<Header: 'static, SignedTx: SignedTransaction + 'static, Withdrawals: 'static> {
     /// See [`BlockBody`].
     fn transactions(&self) -> &[SignedTx];
     /// See [`BlockBody`].
@@ -125,23 +141,26 @@ pub trait Body<Header, SignedTx: SignedTransaction, Withdrawals> {
     fn calculate_withdrawals_root(&self) -> Option<B256>;
     /// See [`BlockBody`].
     fn recover_signers(&self) -> Option<Vec<Address>> {
-        let num_txns = self.transactions().len();
-        SignedTx::recover_signers(self.transactions(), num_txns)
+        if self.transactions().len() < *PARALLEL_SENDER_RECOVERY_THRESHOLD {
+            self.transactions().iter().map(|tx| tx.recover_signer()).collect()
+        } else {
+            self.transactions().par_iter().map(|tx| tx.recover_signer()).collect()
+        }
     }
     /// See [`BlockBody`].
     fn has_blob_transactions(&self) -> bool {
-        self.transactions().iter().any(|tx| tx.tx_type().is_eip4844())
+        self.transactions().iter().any(|tx| tx.transaction().tx_type().is_eip4844())
     }
     /// See [`BlockBody`].
     fn has_eip7702_transactions(&self) -> bool {
-        self.transactions().iter().any(|tx| tx.tx_type().is_eip7702())
+        self.transactions().iter().any(|tx| tx.transaction().tx_type().is_eip7702())
     }
     /// See [`BlockBody`].
     fn blob_transactions_iter<'a>(&'a self) -> impl Iterator<Item = &'a SignedTx> + 'a
     where
         SignedTx: 'a,
     {
-        self.transactions().iter().filter(|tx| tx.tx_type().is_eip4844())
+        self.transactions().iter().filter(|tx| tx.transaction().tx_type().is_eip4844())
     }
     /// See [`BlockBody`].
     fn blob_transactions(&self) -> Vec<&SignedTx> {

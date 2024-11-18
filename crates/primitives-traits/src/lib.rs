@@ -26,7 +26,8 @@ pub use receipt::{FullReceipt, Receipt};
 
 pub mod transaction;
 pub use transaction::{
-    signed::{FullSignedTx, SignedTransaction, PARALLEL_SENDER_RECOVERY_THRESHOLD},
+    execute::FillTxEnv,
+    signed::{FullSignedTx, SignedTransaction},
     FullTransaction, Transaction, TransactionExt,
 };
 
@@ -35,7 +36,7 @@ pub use integer_list::{IntegerList, IntegerListError};
 
 pub mod block;
 pub use block::{
-    body::{BlockBody, Body, FullBlockBody},
+    body::{BlockBody, Body, FullBlockBody, PARALLEL_SENDER_RECOVERY_THRESHOLD},
     header::{BlockHeader, FullBlockHeader, Header},
     Block, FullBlock,
 };

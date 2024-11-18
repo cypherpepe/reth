@@ -25,21 +25,7 @@ impl<T> FullBlock for T where T: Block<Header: FullBlockHeader, Body: FullBlockB
 // senders
 #[auto_impl::auto_impl(&, Arc)]
 pub trait Block:
-    Send
-    + Sync
-    + Unpin
-    + Clone
-    + Default
-    + fmt::Debug
-    + PartialEq
-    + Eq
-    + Header
-    + Body<
-        Self::Header,
-        <Self::Body as BlockBody>::Transaction,
-        <Self::Body as BlockBody>::Withdrawals,
-    > + InMemorySize
-    + MaybeSerde
+    Send + Sync + Unpin + Clone + Default + fmt::Debug + PartialEq + Eq + InMemorySize + MaybeSerde
 {
     /// Header part of the block.
     type Header: BlockHeader + 'static;
