@@ -4,7 +4,7 @@ use crate::{
     CanonStateNotification, CanonStateNotificationSender, CanonStateNotifications,
     ChainInfoTracker, MemoryOverlayStateProvider,
 };
-use alloy_consensus::BlockHeader;
+use alloy_consensus::{transaction::TransactionMeta, BlockHeader};
 use alloy_eips::{eip2718::Encodable2718, BlockHashOrNumber, BlockNumHash};
 use alloy_primitives::{map::HashMap, Address, TxHash, B256};
 use parking_lot::RwLock;
@@ -12,10 +12,9 @@ use reth_chainspec::ChainInfo;
 use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_metrics::{metrics::Gauge, Metrics};
 use reth_primitives::{
-    BlockWithSenders, EthPrimitives, NodePrimitives, Receipts, SealedBlock, SealedBlockFor,
-    SealedBlockWithSenders, SealedHeader, TransactionMeta,
+    EthPrimitives, NodePrimitives, Receipts, RecoveredBlock, SealedBlock, SealedHeader,
 };
-use reth_primitives_traits::{Block, BlockBody as _, SignedTransaction};
+use reth_primitives_traits::{BlockBody as _, SignedTransaction};
 use reth_storage_api::StateProviderBox;
 use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
@@ -160,7 +159,7 @@ impl<N: NodePrimitives> CanonicalInMemoryStateInner<N> {
 }
 
 type PendingBlockAndReceipts<N> =
-    (SealedBlockFor<<N as NodePrimitives>::Block>, Vec<reth_primitives_traits::ReceiptTy<N>>);
+    (SealedBlock<<N as NodePrimitives>::Block>, Vec<reth_primitives_traits::ReceiptTy<N>>);
 
 /// This type is responsible for providing the blocks, receipts, and state for
 /// all canonical blocks not on disk yet and keeps track of the block range that
@@ -181,9 +180,9 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
         safe: Option<SealedHeader<N::BlockHeader>>,
     ) -> Self {
         let in_memory_state = InMemoryState::new(blocks, numbers, pending);
-        let header = in_memory_state
-            .head_state()
-            .map_or_else(SealedHeader::default, |state| state.block_ref().block().header.clone());
+        let header = in_memory_state.head_state().map_or_else(SealedHeader::default, |state| {
+            state.block_ref().block().clone_sealed_header()
+        });
         let chain_info_tracker = ChainInfoTracker::new(header, finalized, safe);
         let (canon_state_notification_sender, _) =
             broadcast::channel(CANON_STATE_NOTIFICATION_CHANNEL_SIZE);
@@ -229,7 +228,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
 
     /// Returns the header corresponding to the given hash.
     pub fn header_by_hash(&self, hash: B256) -> Option<SealedHeader<N::BlockHeader>> {
-        self.state_by_hash(hash).map(|block| block.block_ref().block.header.clone())
+        self.state_by_hash(hash).map(|block| block.block_ref().block.clone_sealed_header())
     }
 
     /// Clears all entries in the in memory state.
@@ -462,7 +461,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
 
     /// Returns the `SealedHeader` corresponding to the pending state.
     pub fn pending_sealed_header(&self) -> Option<SealedHeader<N::BlockHeader>> {
-        self.pending_state().map(|h| h.block_ref().block().header.clone())
+        self.pending_state().map(|h| h.block_ref().block().clone_sealed_header())
     }
 
     /// Returns the `Header` corresponding to the pending state.
@@ -471,17 +470,17 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
     }
 
     /// Returns the `SealedBlock` corresponding to the pending state.
-    pub fn pending_block(&self) -> Option<SealedBlock<N::BlockHeader, N::BlockBody>> {
+    pub fn pending_block(&self) -> Option<SealedBlock<N::Block>> {
         self.pending_state().map(|block_state| block_state.block_ref().block().clone())
     }
 
-    /// Returns the `SealedBlockWithSenders` corresponding to the pending state.
-    pub fn pending_block_with_senders(&self) -> Option<SealedBlockWithSenders<N::Block>>
+    /// Returns the `RecoveredBlock` corresponding to the pending state.
+    pub fn pending_recovered_block(&self) -> Option<RecoveredBlock<N::Block>>
     where
         N::SignedTx: SignedTransaction,
     {
         self.pending_state()
-            .and_then(|block_state| block_state.block_ref().block().clone().seal_with_senders())
+            .and_then(|block_state| block_state.block_ref().block().clone().try_recover().ok())
     }
 
     /// Returns a tuple with the `SealedBlock` corresponding to the pending
@@ -549,7 +548,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
             if let Some(tx) = block_state
                 .block_ref()
                 .block()
-                .body
+                .body()
                 .transactions()
                 .iter()
                 .find(|tx| tx.trie_hash() == hash)
@@ -573,7 +572,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
             if let Some((index, tx)) = block_state
                 .block_ref()
                 .block()
-                .body
+                .body()
                 .transactions()
                 .iter()
                 .enumerate()
@@ -584,7 +583,7 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
                     index: index as u64,
                     block_hash: block_state.hash(),
                     block_number: block_state.block_ref().block.number(),
-                    base_fee: block_state.block_ref().block.header.base_fee_per_gas(),
+                    base_fee: block_state.block_ref().block.base_fee_per_gas(),
                     timestamp: block_state.block_ref().block.timestamp(),
                     excess_blob_gas: block_state.block_ref().block.excess_blob_gas(),
                 };
@@ -636,19 +635,11 @@ impl<N: NodePrimitives> BlockState<N> {
         &self.block
     }
 
-    /// Returns the block with senders for the state.
-    pub fn block_with_senders(&self) -> BlockWithSenders<N::Block> {
+    /// Returns a clone of the block with recovered senders for the state.
+    pub fn clone_recovered_block(&self) -> RecoveredBlock<N::Block> {
         let block = self.block.block().clone();
         let senders = self.block.senders().clone();
-        let (header, body) = block.split_header_body();
-        BlockWithSenders::new_unchecked(N::Block::new(header.unseal(), body), senders)
-    }
-
-    /// Returns the sealed block with senders for the state.
-    pub fn sealed_block_with_senders(&self) -> SealedBlockWithSenders<N::Block> {
-        let block = self.block.block().clone();
-        let senders = self.block.senders().clone();
-        SealedBlockWithSenders { block, senders }
+        RecoveredBlock::new_sealed(block, senders)
     }
 
     /// Returns the hash of executed block that determines the state.
@@ -664,7 +655,7 @@ impl<N: NodePrimitives> BlockState<N> {
     /// Returns the state root after applying the executed block that determines
     /// the state.
     pub fn state_root(&self) -> B256 {
-        self.block.block().header.state_root()
+        self.block.block().state_root()
     }
 
     /// Returns the `Receipts` of executed block that determines the state.
@@ -758,7 +749,7 @@ impl<N: NodePrimitives> BlockState<N> {
             block_state
                 .block_ref()
                 .block()
-                .body
+                .body()
                 .transactions()
                 .iter()
                 .find(|tx| tx.trie_hash() == hash)
@@ -778,7 +769,7 @@ impl<N: NodePrimitives> BlockState<N> {
             block_state
                 .block_ref()
                 .block()
-                .body
+                .body()
                 .transactions()
                 .iter()
                 .enumerate()
@@ -789,7 +780,7 @@ impl<N: NodePrimitives> BlockState<N> {
                         index: index as u64,
                         block_hash: block_state.hash(),
                         block_number: block_state.block_ref().block.number(),
-                        base_fee: block_state.block_ref().block.header.base_fee_per_gas(),
+                        base_fee: block_state.block_ref().block.base_fee_per_gas(),
                         timestamp: block_state.block_ref().block.timestamp(),
                         excess_blob_gas: block_state.block_ref().block.excess_blob_gas(),
                     };
@@ -803,7 +794,7 @@ impl<N: NodePrimitives> BlockState<N> {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ExecutedBlock<N: NodePrimitives = EthPrimitives> {
     /// Sealed block the rest of fields refer to.
-    pub block: Arc<SealedBlockFor<N::Block>>,
+    pub block: Arc<SealedBlock<N::Block>>,
     /// Block's senders.
     pub senders: Arc<Vec<Address>>,
     /// Block's execution outcome.
@@ -817,7 +808,7 @@ pub struct ExecutedBlock<N: NodePrimitives = EthPrimitives> {
 impl<N: NodePrimitives> ExecutedBlock<N> {
     /// [`ExecutedBlock`] constructor.
     pub const fn new(
-        block: Arc<SealedBlockFor<N::Block>>,
+        block: Arc<SealedBlock<N::Block>>,
         senders: Arc<Vec<Address>>,
         execution_output: Arc<ExecutionOutcome<N::Receipt>>,
         hashed_state: Arc<HashedPostState>,
@@ -827,7 +818,7 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
     }
 
     /// Returns a reference to the executed block.
-    pub fn block(&self) -> &SealedBlockFor<N::Block> {
+    pub fn block(&self) -> &SealedBlock<N::Block> {
         &self.block
     }
 
@@ -836,11 +827,11 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         &self.senders
     }
 
-    /// Returns a [`SealedBlockWithSenders`]
+    /// Returns a [`RecoveredBlock`]
     ///
     /// Note: this clones the block and senders.
-    pub fn sealed_block_with_senders(&self) -> SealedBlockWithSenders<N::Block> {
-        SealedBlockWithSenders { block: (*self.block).clone(), senders: (*self.senders).clone() }
+    pub fn clone_recovered_block(&self) -> RecoveredBlock<N::Block> {
+        RecoveredBlock::new_sealed((*self.block).clone(), (*self.senders).clone())
     }
 
     /// Returns a reference to the block's execution outcome
@@ -899,7 +890,7 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
             Self::Commit { new } => {
                 let new = Arc::new(new.iter().fold(Chain::default(), |mut chain, exec| {
                     chain.append_block(
-                        exec.sealed_block_with_senders(),
+                        exec.clone_recovered_block(),
                         exec.execution_outcome().clone(),
                     );
                     chain
@@ -909,14 +900,14 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
             Self::Reorg { new, old } => {
                 let new = Arc::new(new.iter().fold(Chain::default(), |mut chain, exec| {
                     chain.append_block(
-                        exec.sealed_block_with_senders(),
+                        exec.clone_recovered_block(),
                         exec.execution_outcome().clone(),
                     );
                     chain
                 }));
                 let old = Arc::new(old.iter().fold(Chain::default(), |mut chain, exec| {
                     chain.append_block(
-                        exec.sealed_block_with_senders(),
+                        exec.clone_recovered_block(),
                         exec.execution_outcome().clone(),
                     );
                     chain
@@ -930,7 +921,7 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
     ///
     /// Returns the new tip for [`Self::Reorg`] and [`Self::Commit`] variants which commit at least
     /// 1 new block.
-    pub fn tip(&self) -> &SealedBlockFor<N::Block> {
+    pub fn tip(&self) -> &SealedBlock<N::Block> {
         match self {
             Self::Commit { new } | Self::Reorg { new, .. } => {
                 new.last().expect("non empty blocks").block()
@@ -1318,15 +1309,15 @@ mod tests {
         );
 
         // Check the pending header
-        assert_eq!(state.pending_header().unwrap(), block2.block().header.header().clone());
+        assert_eq!(state.pending_header().unwrap(), block2.block().header().clone());
 
         // Check the pending sealed header
-        assert_eq!(state.pending_sealed_header().unwrap(), block2.block().header.clone());
+        assert_eq!(state.pending_sealed_header().unwrap(), block2.block().clone_sealed_header());
 
         // Check the pending block with senders
         assert_eq!(
-            state.pending_block_with_senders().unwrap(),
-            block2.block().clone().seal_with_senders().unwrap()
+            state.pending_recovered_block().unwrap(),
+            block2.block().clone().try_recover().unwrap()
         );
 
         // Check the pending block and receipts
@@ -1529,7 +1520,7 @@ mod tests {
             chain_commit.to_chain_notification(),
             CanonStateNotification::Commit {
                 new: Arc::new(Chain::new(
-                    vec![block0.sealed_block_with_senders(), block1.sealed_block_with_senders()],
+                    vec![block0.clone_recovered_block(), block1.clone_recovered_block()],
                     sample_execution_outcome.clone(),
                     None
                 ))
@@ -1546,12 +1537,12 @@ mod tests {
             chain_reorg.to_chain_notification(),
             CanonStateNotification::Reorg {
                 old: Arc::new(Chain::new(
-                    vec![block1.sealed_block_with_senders(), block2.sealed_block_with_senders()],
+                    vec![block1.clone_recovered_block(), block2.clone_recovered_block()],
                     sample_execution_outcome.clone(),
                     None
                 )),
                 new: Arc::new(Chain::new(
-                    vec![block1a.sealed_block_with_senders(), block2a.sealed_block_with_senders()],
+                    vec![block1a.clone_recovered_block(), block2a.clone_recovered_block()],
                     sample_execution_outcome,
                     None
                 ))

@@ -17,19 +17,17 @@
 
 extern crate alloc;
 
-use crate::builder::RethEvmBuilder;
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use reth_primitives_traits::{BlockHeader, SignedTransaction};
 use revm::{Database, Evm, GetInspector};
-use revm_primitives::{BlockEnv, CfgEnvWithHandlerCfg, Env, EnvWithHandlerCfg, SpecId, TxEnv};
+use revm_primitives::{BlockEnv, CfgEnvWithHandlerCfg, Env, SpecId, TxEnv};
 
-pub mod builder;
 pub mod either;
 /// EVM environment configuration.
 pub mod env;
 pub mod execute;
-use env::EvmEnv;
+pub use env::EvmEnv;
 
 #[cfg(feature = "std")]
 pub mod metrics;
@@ -41,33 +39,23 @@ pub mod system_calls;
 pub mod test_utils;
 
 /// Trait for configuring the EVM for executing full blocks.
-#[auto_impl::auto_impl(&, Arc)]
 pub trait ConfigureEvm: ConfigureEvmEnv {
-    /// Associated type for the default external context that should be configured for the EVM.
-    type DefaultExternalContext<'a>;
-
-    /// Returns new EVM with the given database
-    ///
-    /// This does not automatically configure the EVM with [`ConfigureEvmEnv`] methods. It is up to
-    /// the caller to call an appropriate method to fill the transaction and block environment
-    /// before executing any transactions using the provided EVM.
-    fn evm<DB: Database>(&self, db: DB) -> Evm<'_, Self::DefaultExternalContext<'_>, DB> {
-        RethEvmBuilder::new(db, self.default_external_context()).build()
-    }
-
     /// Returns a new EVM with the given database configured with the given environment settings,
-    /// including the spec id.
+    /// including the spec id and transaction environment.
     ///
     /// This will preserve any handler modifications
-    fn evm_with_env<DB: Database>(
-        &self,
-        db: DB,
-        env: EnvWithHandlerCfg,
-    ) -> Evm<'_, Self::DefaultExternalContext<'_>, DB> {
-        let mut evm = self.evm(db);
-        evm.modify_spec_id(env.spec_id());
-        evm.context.evm.env = env.env;
-        evm
+    fn evm_with_env<DB: Database>(&self, db: DB, evm_env: EvmEnv, tx: TxEnv) -> Evm<'_, (), DB>;
+
+    /// Returns a new EVM with the given database configured with `cfg` and `block_env`
+    /// configuration derived from the given header. Relies on
+    /// [`ConfigureEvmEnv::cfg_and_block_env`].
+    ///
+    /// # Caution
+    ///
+    /// This does not initialize the tx environment.
+    fn evm_for_block<DB: Database>(&self, db: DB, header: &Self::Header) -> Evm<'_, (), DB> {
+        let evm_env = self.cfg_and_block_env(header);
+        self.evm_with_env(db, evm_env, Default::default())
     }
 
     /// Returns a new EVM with the given database configured with the given environment settings,
@@ -79,34 +67,41 @@ pub trait ConfigureEvm: ConfigureEvmEnv {
     fn evm_with_env_and_inspector<DB, I>(
         &self,
         db: DB,
-        env: EnvWithHandlerCfg,
+        evm_env: EvmEnv,
+        tx: TxEnv,
+        inspector: I,
+    ) -> Evm<'_, I, DB>
+    where
+        DB: Database,
+        I: GetInspector<DB>;
+}
+
+impl<'b, T> ConfigureEvm for &'b T
+where
+    T: ConfigureEvm,
+    &'b T: ConfigureEvmEnv<Header = T::Header>,
+{
+    fn evm_for_block<DB: Database>(&self, db: DB, header: &Self::Header) -> Evm<'_, (), DB> {
+        (*self).evm_for_block(db, header)
+    }
+
+    fn evm_with_env<DB: Database>(&self, db: DB, evm_env: EvmEnv, tx: TxEnv) -> Evm<'_, (), DB> {
+        (*self).evm_with_env(db, evm_env, tx)
+    }
+
+    fn evm_with_env_and_inspector<DB, I>(
+        &self,
+        db: DB,
+        evm_env: EvmEnv,
+        tx_env: TxEnv,
         inspector: I,
     ) -> Evm<'_, I, DB>
     where
         DB: Database,
         I: GetInspector<DB>,
     {
-        let mut evm = self.evm_with_inspector(db, inspector);
-        evm.modify_spec_id(env.spec_id());
-        evm.context.evm.env = env.env;
-        evm
+        (*self).evm_with_env_and_inspector(db, evm_env, tx_env, inspector)
     }
-
-    /// Returns a new EVM with the given inspector.
-    ///
-    /// Caution: This does not automatically configure the EVM with [`ConfigureEvmEnv`] methods. It
-    /// is up to the caller to call an appropriate method to fill the transaction and block
-    /// environment before executing any transactions using the provided EVM.
-    fn evm_with_inspector<DB, I>(&self, db: DB, inspector: I) -> Evm<'_, I, DB>
-    where
-        DB: Database,
-        I: GetInspector<DB>,
-    {
-        RethEvmBuilder::new(db, self.default_external_context()).build_with_inspector(inspector)
-    }
-
-    /// Provides the default external context.
-    fn default_external_context<'a>(&self) -> Self::DefaultExternalContext<'a>;
 }
 
 /// This represents the set of methods used to configure the EVM's environment before block
@@ -157,11 +152,11 @@ pub trait ConfigureEvmEnv: Send + Sync + Unpin + Clone + 'static {
     fn fill_cfg_env(&self, cfg_env: &mut CfgEnvWithHandlerCfg, header: &Self::Header);
 
     /// Fill [`BlockEnv`] field according to the chain spec and given header
-    fn fill_block_env(&self, block_env: &mut BlockEnv, header: &Self::Header, after_merge: bool) {
+    fn fill_block_env(&self, block_env: &mut BlockEnv, header: &Self::Header, spec_id: SpecId) {
         block_env.number = U256::from(header.number());
         block_env.coinbase = header.beneficiary();
         block_env.timestamp = U256::from(header.timestamp());
-        if after_merge {
+        if spec_id >= SpecId::MERGE {
             block_env.prevrandao = header.mix_hash();
             block_env.difficulty = U256::ZERO;
         } else {
@@ -173,7 +168,7 @@ pub trait ConfigureEvmEnv: Send + Sync + Unpin + Clone + 'static {
 
         // EIP-4844 excess blob gas of this block, introduced in Cancun
         if let Some(excess_blob_gas) = header.excess_blob_gas() {
-            block_env.set_blob_excess_gas_and_price(excess_blob_gas);
+            block_env.set_blob_excess_gas_and_price(excess_blob_gas, spec_id >= SpecId::PRAGUE);
         }
     }
 
@@ -196,8 +191,7 @@ pub trait ConfigureEvmEnv: Send + Sync + Unpin + Clone + 'static {
         header: &Self::Header,
     ) {
         self.fill_cfg_env(cfg, header);
-        let after_merge = cfg.handler_cfg.spec_id >= SpecId::MERGE;
-        self.fill_block_env(block_env, header, after_merge);
+        self.fill_block_env(block_env, header, cfg.handler_cfg.spec_id);
     }
 
     /// Returns the configured [`EvmEnv`] for `parent + 1` block.

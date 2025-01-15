@@ -4,6 +4,8 @@
 #![allow(missing_docs)]
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use proptest::test_runner::TestRunner;
+use rand::Rng;
 use reth_engine_tree::tree::root::{StateRootConfig, StateRootTask};
 use reth_evm::system_calls::OnStateHook;
 use reth_primitives::{Account as RethAccount, StorageEntry};
@@ -12,7 +14,6 @@ use reth_provider::{
     test_utils::{create_test_provider_factory, MockNodeTypesWithDB},
     AccountReader, HashingWriter, ProviderFactory,
 };
-use reth_testing_utils::generators::{self, Rng};
 use reth_trie::{
     hashed_cursor::HashedPostStateCursorFactory, proof::ProofBlindedProviderFactory,
     trie_cursor::InMemoryTrieCursorFactory, TrieInput,
@@ -22,7 +23,7 @@ use revm_primitives::{
     Account as RevmAccount, AccountInfo, AccountStatus, Address, EvmState, EvmStorageSlot, HashMap,
     B256, KECCAK_EMPTY, U256,
 };
-use std::hint::black_box;
+use std::{hint::black_box, sync::Arc};
 
 #[derive(Debug, Clone)]
 struct BenchParams {
@@ -35,7 +36,8 @@ struct BenchParams {
 /// Generates a series of random state updates with configurable accounts,
 /// storage, and self-destructs
 fn create_bench_state_updates(params: &BenchParams) -> Vec<EvmState> {
-    let mut rng = generators::rng();
+    let mut runner = TestRunner::deterministic();
+    let mut rng = runner.rng().clone();
     let all_addresses: Vec<Address> = (0..params.num_accounts).map(|_| rng.gen()).collect();
     let mut updates = Vec::new();
 
@@ -215,11 +217,13 @@ fn bench_state_root(c: &mut Criterion) {
                         let num_threads = std::thread::available_parallelism()
                             .map_or(1, |num| (num.get() / 2).max(1));
 
-                        let state_root_task_pool = rayon::ThreadPoolBuilder::new()
-                            .num_threads(num_threads)
-                            .thread_name(|i| format!("proof-worker-{}", i))
-                            .build()
-                            .expect("Failed to create proof worker thread pool");
+                        let state_root_task_pool = Arc::new(
+                            rayon::ThreadPoolBuilder::new()
+                                .num_threads(num_threads)
+                                .thread_name(|i| format!("proof-worker-{}", i))
+                                .build()
+                                .expect("Failed to create proof worker thread pool"),
+                        );
 
                         (
                             config,
@@ -256,7 +260,7 @@ fn bench_state_root(c: &mut Criterion) {
                             let task = StateRootTask::new(
                                 config,
                                 blinded_provider_factory,
-                                &state_root_task_pool,
+                                state_root_task_pool,
                             );
                             let mut hook = task.state_hook();
                             let handle = task.spawn(scope);

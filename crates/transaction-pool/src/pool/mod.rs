@@ -109,7 +109,7 @@ pub use events::{FullTransactionEvent, TransactionEvent};
 pub use listener::{AllTransactionsEvents, TransactionEvents};
 pub use parked::{BasefeeOrd, ParkedOrd, ParkedPool, QueuedOrd};
 pub use pending::PendingPool;
-use reth_primitives_traits::{BlockBody, BlockHeader};
+use reth_primitives_traits::Block;
 
 mod best;
 mod blob;
@@ -357,7 +357,7 @@ where
             };
 
             size += encoded_len;
-            elements.push(pooled.into_signed());
+            elements.push(pooled.into_tx());
 
             if limit.exceeds(size) {
                 break
@@ -379,10 +379,9 @@ where
     }
 
     /// Updates the entire pool after a new block was executed.
-    pub fn on_canonical_state_change<H, B>(&self, update: CanonicalStateUpdate<'_, H, B>)
+    pub fn on_canonical_state_change<B>(&self, update: CanonicalStateUpdate<'_, B>)
     where
-        H: BlockHeader,
-        B: BlockBody,
+        B: Block,
     {
         trace!(target: "txpool", ?update, "updating pool on canonical state change");
 

@@ -25,9 +25,9 @@ use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_util::{NoopPayloadTransactions, PayloadTransactions};
 use reth_primitives::{
-    proofs, transaction::SignedTransactionIntoRecoveredExt, Block, BlockBody, BlockExt,
-    SealedHeader, TxType,
+    proofs, transaction::SignedTransactionIntoRecoveredExt, Block, BlockBody, SealedHeader, TxType,
 };
+use reth_primitives_traits::block::Block as _;
 use reth_provider::{
     HashedPostStateProvider, ProviderError, StateProofProvider, StateProviderFactory,
     StateRootProvider,
@@ -38,10 +38,7 @@ use reth_transaction_pool::{
 };
 use revm::{
     db::{states::bundle_state::BundleRetention, State},
-    primitives::{
-        BlockEnv, CfgEnvWithHandlerCfg, EVMError, EnvWithHandlerCfg, InvalidTransaction,
-        ResultAndState, TxEnv,
-    },
+    primitives::{EVMError, InvalidTransaction, ResultAndState},
     Database, DatabaseCommit,
 };
 use std::{fmt::Display, sync::Arc};
@@ -127,7 +124,6 @@ where
         let evm_env = self
             .cfg_and_block_env(&args.config.attributes, &args.config.parent_header)
             .map_err(PayloadBuilderError::other)?;
-        let EvmEnv { cfg_env_with_handler_cfg, block_env } = evm_env;
 
         let BuildArguments { client, pool: _, mut cached_reads, config, cancel, best_payload } =
             args;
@@ -136,8 +132,7 @@ where
             evm_config: self.evm_config.clone(),
             chain_spec: client.chain_spec(),
             config,
-            initialized_cfg: cfg_env_with_handler_cfg,
-            initialized_block_env: block_env,
+            evm_env,
             cancel,
             best_payload,
         };
@@ -192,15 +187,13 @@ where
 
         let evm_env =
             self.cfg_and_block_env(&attributes, &parent).map_err(PayloadBuilderError::other)?;
-        let EvmEnv { cfg_env_with_handler_cfg, block_env } = evm_env;
 
         let config = PayloadConfig { parent_header: Arc::new(parent), attributes };
         let ctx = OpPayloadBuilderCtx {
             evm_config: self.evm_config.clone(),
             chain_spec: client.chain_spec(),
             config,
-            initialized_cfg: cfg_env_with_handler_cfg,
-            initialized_block_env: block_env,
+            evm_env,
             cancel: Default::default(),
             best_payload: Default::default(),
         };
@@ -402,7 +395,7 @@ where
         let header = Header {
             parent_hash: ctx.parent().hash(),
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: ctx.initialized_block_env.coinbase,
+            beneficiary: ctx.evm_env.block_env.coinbase,
             state_root,
             transactions_root,
             receipts_root,
@@ -421,7 +414,6 @@ where
             blob_gas_used,
             excess_blob_gas,
             requests_hash: None,
-            target_blobs_per_block: None,
         };
 
         // seal the block
@@ -435,7 +427,7 @@ where
         };
 
         let sealed_block = Arc::new(block.seal_slow());
-        debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header, "sealed built block");
+        debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
 
         // create the executed block data
         let executed: ExecutedBlock<OpPrimitives> = ExecutedBlock {
@@ -558,9 +550,7 @@ pub struct OpPayloadBuilderCtx<EvmConfig> {
     /// How to build the payload.
     pub config: PayloadConfig<OpPayloadBuilderAttributes>,
     /// Evm Settings
-    pub initialized_cfg: CfgEnvWithHandlerCfg,
-    /// Block config
-    pub initialized_block_env: BlockEnv,
+    pub evm_env: EvmEnv,
     /// Marker to check whether the job has been cancelled.
     pub cancel: Cancelled,
     /// The currently best payload.
@@ -589,22 +579,22 @@ impl<EvmConfig> OpPayloadBuilderCtx<EvmConfig> {
     pub fn block_gas_limit(&self) -> u64 {
         self.attributes()
             .gas_limit
-            .unwrap_or_else(|| self.initialized_block_env.gas_limit.saturating_to())
+            .unwrap_or_else(|| self.evm_env.block_env.gas_limit.saturating_to())
     }
 
     /// Returns the block number for the block.
     pub fn block_number(&self) -> u64 {
-        self.initialized_block_env.number.to()
+        self.evm_env.block_env.number.to()
     }
 
     /// Returns the current base fee
     pub fn base_fee(&self) -> u64 {
-        self.initialized_block_env.basefee.to()
+        self.evm_env.block_env.basefee.to()
     }
 
     /// Returns the current blob gas price.
     pub fn get_blob_gasprice(&self) -> Option<u64> {
-        self.initialized_block_env.get_blob_gasprice().map(|gasprice| gasprice as u64)
+        self.evm_env.block_env.get_blob_gasprice().map(|gasprice| gasprice as u64)
     }
 
     /// Returns the blob fields for the header.
@@ -723,8 +713,8 @@ where
         SystemCaller::new(self.evm_config.clone(), self.chain_spec.clone())
             .pre_block_beacon_root_contract_call(
                 db,
-                &self.initialized_cfg,
-                &self.initialized_block_env,
+                &self.evm_env.cfg_env_with_handler_cfg,
+                &self.evm_env.block_env,
                 self.attributes().payload_attributes.parent_beacon_block_root,
             )
             .map_err(|err| {
@@ -748,13 +738,8 @@ where
         DB: Database<Error = ProviderError>,
     {
         let mut info = ExecutionInfo::with_capacity(self.attributes().transactions.len());
-
-        let env = EnvWithHandlerCfg::new_with_cfg_env(
-            self.initialized_cfg.clone(),
-            self.initialized_block_env.clone(),
-            TxEnv::default(),
-        );
-        let mut evm = self.evm_config.evm_with_env(&mut *db, env);
+        let mut evm =
+            self.evm_config.evm_with_env(&mut *db, self.evm_env.clone(), Default::default());
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -791,7 +776,7 @@ where
                     ))
                 })?;
 
-            *evm.tx_mut() = self.evm_config.tx_env(sequencer_tx.as_signed(), sequencer_tx.signer());
+            *evm.tx_mut() = self.evm_config.tx_env(sequencer_tx.tx(), sequencer_tx.signer());
 
             let ResultAndState { result, state } = match evm.transact() {
                 Ok(res) => res,
@@ -819,7 +804,7 @@ where
 
             let receipt = alloy_consensus::Receipt {
                 status: Eip658Value::Eip658(result.is_success()),
-                cumulative_gas_used: info.cumulative_gas_used as u128,
+                cumulative_gas_used: info.cumulative_gas_used,
                 logs: result.into_logs().into_iter().collect(),
             };
 
@@ -842,7 +827,7 @@ where
 
             // append sender and transaction to the respective lists
             info.executed_senders.push(sequencer_tx.signer());
-            info.executed_transactions.push(sequencer_tx.into_signed());
+            info.executed_transactions.push(sequencer_tx.into_tx());
         }
 
         Ok(info)
@@ -863,12 +848,8 @@ where
         let block_gas_limit = self.block_gas_limit();
         let base_fee = self.base_fee();
 
-        let env = EnvWithHandlerCfg::new_with_cfg_env(
-            self.initialized_cfg.clone(),
-            self.initialized_block_env.clone(),
-            TxEnv::default(),
-        );
-        let mut evm = self.evm_config.evm_with_env(&mut *db, env);
+        let mut evm =
+            self.evm_config.evm_with_env(&mut *db, self.evm_env.clone(), Default::default());
 
         while let Some(tx) = best_txs.next(()) {
             // ensure we still have capacity for this transaction
@@ -892,7 +873,7 @@ where
             }
 
             // Configure the environment for the tx.
-            *evm.tx_mut() = self.evm_config.tx_env(tx.as_signed(), tx.signer());
+            *evm.tx_mut() = self.evm_config.tx_env(tx.tx(), tx.signer());
 
             let ResultAndState { result, state } = match evm.transact() {
                 Ok(res) => res,
@@ -930,7 +911,7 @@ where
 
             let receipt = alloy_consensus::Receipt {
                 status: Eip658Value::Eip658(result.is_success()),
-                cumulative_gas_used: info.cumulative_gas_used as u128,
+                cumulative_gas_used: info.cumulative_gas_used,
                 logs: result.into_logs().into_iter().collect(),
             };
 
@@ -955,7 +936,7 @@ where
 
             // append sender and transaction to the respective lists
             info.executed_senders.push(tx.signer());
-            info.executed_transactions.push(tx.into_signed());
+            info.executed_transactions.push(tx.into_tx());
         }
 
         Ok(None)

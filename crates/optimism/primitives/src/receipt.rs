@@ -188,7 +188,7 @@ impl TxReceipt for OpReceipt {
         self.as_receipt().bloom()
     }
 
-    fn cumulative_gas_used(&self) -> u128 {
+    fn cumulative_gas_used(&self) -> u64 {
         self.as_receipt().cumulative_gas_used()
     }
 
@@ -210,6 +210,21 @@ impl InMemorySize for OpReceipt {
 }
 
 impl reth_primitives_traits::Receipt for OpReceipt {}
+
+/// Trait for deposit receipt.
+pub trait DepositReceipt: reth_primitives_traits::Receipt {
+    /// Returns deposit receipt if it is a deposit transaction.
+    fn as_deposit_receipt_mut(&mut self) -> Option<&mut OpDepositReceipt>;
+}
+
+impl DepositReceipt for OpReceipt {
+    fn as_deposit_receipt_mut(&mut self) -> Option<&mut OpDepositReceipt> {
+        match self {
+            Self::Deposit(receipt) => Some(receipt),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(feature = "reth-codec")]
 mod compact {
@@ -236,7 +251,7 @@ mod compact {
             Self {
                 tx_type: receipt.tx_type(),
                 success: receipt.status(),
-                cumulative_gas_used: receipt.cumulative_gas_used() as u64,
+                cumulative_gas_used: receipt.cumulative_gas_used(),
                 logs: Cow::Borrowed(&receipt.as_receipt().logs),
                 deposit_nonce: if let OpReceipt::Deposit(receipt) = receipt {
                     receipt.deposit_nonce
@@ -263,11 +278,8 @@ mod compact {
                 deposit_receipt_version,
             } = receipt;
 
-            let inner = Receipt {
-                status: success.into(),
-                cumulative_gas_used: cumulative_gas_used as u128,
-                logs: logs.into_owned(),
-            };
+            let inner =
+                Receipt { status: success.into(), cumulative_gas_used, logs: logs.into_owned() };
 
             match tx_type {
                 OpTxType::Legacy => Self::Legacy(inner),

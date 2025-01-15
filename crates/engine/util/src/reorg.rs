@@ -1,6 +1,7 @@
 //! Stream wrapper that simulates reorgs.
 
 use alloy_consensus::{Header, Transaction};
+use alloy_eips::eip7840::BlobParams;
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionPayload, ExecutionPayloadSidecar, ForkchoiceState, PayloadStatus,
 };
@@ -13,14 +14,14 @@ use reth_engine_primitives::{
 use reth_errors::{BlockExecutionError, BlockValidationError, RethError, RethResult};
 use reth_ethereum_forks::EthereumHardforks;
 use reth_evm::{
-    env::EvmEnv, state_change::post_block_withdrawals_balance_increments,
-    system_calls::SystemCaller, ConfigureEvm,
+    state_change::post_block_withdrawals_balance_increments, system_calls::SystemCaller,
+    ConfigureEvm,
 };
 use reth_payload_validator::ExecutionPayloadValidator;
 use reth_primitives::{
-    proofs, transaction::SignedTransactionIntoRecoveredExt, Block, BlockBody, BlockExt, Receipt,
-    Receipts,
+    proofs, transaction::SignedTransactionIntoRecoveredExt, Block, BlockBody, Receipt, Receipts,
 };
+use reth_primitives_traits::block::Block as _;
 use reth_provider::{BlockReader, ExecutionOutcome, ProviderError, StateProviderFactory};
 use reth_revm::{
     database::StateProviderDatabase,
@@ -28,7 +29,7 @@ use reth_revm::{
     DatabaseCommit,
 };
 use reth_rpc_types_compat::engine::payload::block_to_payload;
-use revm_primitives::{calc_excess_blob_gas, EVMError, EnvWithHandlerCfg};
+use revm_primitives::EVMError;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -268,7 +269,7 @@ where
 
     // Fetch reorg target block depending on its depth and its parent.
     let mut previous_hash = next_block.parent_hash;
-    let mut candidate_transactions = next_block.body.transactions;
+    let mut candidate_transactions = next_block.into_body().transactions;
     let reorg_target = 'target: {
         loop {
             let reorg_target = provider
@@ -296,15 +297,8 @@ where
         .with_bundle_update()
         .build();
 
-    // Configure environments
-    let EvmEnv { cfg_env_with_handler_cfg, block_env } =
-        evm_config.cfg_and_block_env(&reorg_target.header);
-    let env = EnvWithHandlerCfg::new_with_cfg_env(
-        cfg_env_with_handler_cfg,
-        block_env,
-        Default::default(),
-    );
-    let mut evm = evm_config.evm_with_env(&mut state, env);
+    // Configure EVM
+    let mut evm = evm_config.evm_for_block(&mut state, &reorg_target.header);
 
     // apply eip-4788 pre block contract call
     let mut system_caller = SystemCaller::new(evm_config.clone(), chain_spec.clone());
@@ -391,10 +385,7 @@ where
         if chain_spec.is_cancun_active_at_timestamp(reorg_target.timestamp) {
             (
                 Some(sum_blob_gas_used),
-                Some(calc_excess_blob_gas(
-                    reorg_target_parent.excess_blob_gas.unwrap_or_default(),
-                    reorg_target_parent.blob_gas_used.unwrap_or_default(),
-                )),
+                reorg_target_parent.next_block_excess_blob_gas(BlobParams::cancun()),
             )
         } else {
             (None, None)
@@ -425,8 +416,7 @@ where
             blob_gas_used,
             excess_blob_gas,
             state_root: state_provider.state_root(hashed_state)?,
-            requests_hash: None,          // TODO(prague)
-            target_blobs_per_block: None, // TODO(prague)
+            requests_hash: None, // TODO(prague)
         },
         body: BlockBody {
             transactions,
