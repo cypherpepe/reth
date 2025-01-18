@@ -1,6 +1,6 @@
 ## reth Contributor Documentation
 
-This directory contains documentation for contributors.
+This directory contains documntation for contributors.
 
 - [Repository and Project Structure](./repo)
 - [Design](./design)
