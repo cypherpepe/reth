@@ -15,7 +15,9 @@ use op_alloy_rpc_types_engine::OpPayloadAttributes;
 use reth_basic_payload_builder::*;
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
-use reth_evm::{env::EvmEnv, system_calls::SystemCaller, ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::{
+    env::EvmEnv, system_calls::SystemCaller, ConfigureEvm, Evm, NextBlockEnvAttributes,
+};
 use reth_execution_types::ExecutionOutcome;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_consensus::calculate_receipt_root_no_memo_optimism;
@@ -739,8 +741,7 @@ where
         DB: Database<Error = ProviderError>,
     {
         let mut info = ExecutionInfo::with_capacity(self.attributes().transactions.len());
-        let mut evm =
-            self.evm_config.evm_with_env(&mut *db, self.evm_env.clone(), Default::default());
+        let mut evm = self.evm_config.evm_with_env(&mut *db, self.evm_env.clone());
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -777,9 +778,9 @@ where
                     ))
                 })?;
 
-            *evm.tx_mut() = self.evm_config.tx_env(sequencer_tx.tx(), sequencer_tx.signer());
+            let tx_env = self.evm_config.tx_env(sequencer_tx.tx(), sequencer_tx.signer());
 
-            let ResultAndState { result, state } = match evm.transact() {
+            let ResultAndState { result, state } = match evm.transact(tx_env) {
                 Ok(res) => res,
                 Err(err) => {
                     match err {
@@ -849,8 +850,7 @@ where
         let block_gas_limit = self.block_gas_limit();
         let base_fee = self.base_fee();
 
-        let mut evm =
-            self.evm_config.evm_with_env(&mut *db, self.evm_env.clone(), Default::default());
+        let mut evm = self.evm_config.evm_with_env(&mut *db, self.evm_env.clone());
 
         while let Some(tx) = best_txs.next(()) {
             // ensure we still have capacity for this transaction
@@ -874,9 +874,9 @@ where
             }
 
             // Configure the environment for the tx.
-            *evm.tx_mut() = self.evm_config.tx_env(tx.tx(), tx.signer());
+            let tx_env = self.evm_config.tx_env(tx.tx(), tx.signer());
 
-            let ResultAndState { result, state } = match evm.transact() {
+            let ResultAndState { result, state } = match evm.transact(tx_env) {
                 Ok(res) => res,
                 Err(err) => {
                     match err {
